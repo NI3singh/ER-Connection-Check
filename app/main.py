@@ -1,80 +1,371 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from app.database import get_db
-from app.models import UserMetadata, SmurfCluster
-from app.schemas import UserMetadataRequest, IngestionResponse, EntityRiskResponse
+from sqlalchemy import func, and_
+from app.database import get_db, init_database
+from app.models import UserMetadata, SmurfCluster, EntityLink, SignalStrength, AnalysisState
+from app.schemas import (
+    UserMetadataRequest, 
+    IngestionResponse, 
+    EntityRiskResponse,
+    ClusterDetailsResponse,
+    SystemHealthResponse
+)
+from datetime import datetime, timezone
 import logging
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AML System - Entity Resolution Module (The Spider)")
+app = FastAPI(
+    title="AML Entity Resolution Module (GARG-AML Enhanced)",
+    version="2.0.0",
+    description="Multi-layered graph-based fraud detection with confidence scoring"
+)
+
+# Auto-create tables on startup
+@app.on_event("startup")
+def startup_event():
+    """Initialize database tables on API startup"""
+    logger.info("Checking database tables...")
+    init_database()
+
+
+# ============================================================================
+# ENDPOINT 1: METADATA INGESTION (with UPSERT)
+# ============================================================================
 
 @app.post("/api/v1/ingest/user-metadata", response_model=IngestionResponse)
 def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get_db)):
     """
-    Ingest user fingerprints (Device ID, IP, Canvas) for background analysis.
-    This endpoint is FAST (Async Architecture). It just saves data.
+    Ingest user fingerprints with UPSERT logic to prevent duplicates.
+    
+    CRITICAL: Uses composite unique constraint to ensure one row per unique
+    user-fingerprint combination.
     """
     try:
-        # 1. Create the Metadata Record
-        metadata_entry = UserMetadata(
-            user_id=request.user_id,
-            device_hash=request.device_hash,
-            ip_address=request.ip_address,
-            canvas_hash=request.canvas_hash
-        )
+        # UPSERT Logic: Check if this exact combination exists
+        existing = db.query(UserMetadata).filter(
+            and_(
+                UserMetadata.user_id == request.user_id,
+                UserMetadata.device_hash == request.device_hash,
+                UserMetadata.ip_address == request.ip_address,
+                UserMetadata.canvas_hash == request.canvas_hash
+            )
+        ).first()
         
-        # 2. Save to "Memory" (Postgres)
-        db.add(metadata_entry)
+        if existing:
+            # UPDATE: Increment occurrence count and update last_seen
+            existing.occurrence_count += 1
+            existing.last_seen = datetime.now(timezone.utc)
+            action = "updated"
+            
+            logger.info(f"Metadata updated for user: {request.user_id} (seen {existing.occurrence_count}x)")
+        else:
+            # INSERT: Create new metadata record
+            metadata_entry = UserMetadata(
+                user_id=request.user_id,
+                device_hash=request.device_hash,
+                ip_address=request.ip_address,
+                canvas_hash=request.canvas_hash,
+                occurrence_count=1
+            )
+            db.add(metadata_entry)
+            action = "created"
+            
+            logger.info(f"Metadata created for user: {request.user_id}")
+        
         db.commit()
-        db.refresh(metadata_entry)
-        
-        logger.info(f"Metadata saved for user: {request.user_id}")
         
         return IngestionResponse(
             status="success",
-            message="Metadata queued for analysis"
+            message=f"Metadata {action} and queued for analysis"
         )
 
     except Exception as e:
-        logger.error(f"Ingestion failed: {e}")
+        logger.error(f"Ingestion failed: {e}", exc_info=True)
+        db.rollback()
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+# ============================================================================
+# ENDPOINT 2: USER RISK CHECK 
+# ============================================================================
 
 @app.get("/api/v1/user/{user_id}/risk", response_model=EntityRiskResponse)
 def get_user_entity_risk(user_id: str, db: Session = Depends(get_db)):
     """
-    Check if a user is part of a detected Smurf Ring.
-    Used by the betting site before processing withdrawals.
+    Check if user is part of a detected smurf ring.
+    Uses GARG-AML risk scoring for graduated response.
     """
-    # 1. Check if user is in a known cluster
-    cluster_record = db.query(SmurfCluster).filter(
-        SmurfCluster.user_id == user_id, 
+    # Query active clusters
+    cluster_records = db.query(SmurfCluster).filter(
+        SmurfCluster.user_id == user_id,
         SmurfCluster.is_active == True
-    ).first()
-
-    if cluster_record:
-        # User is caught in a ring!
+    ).all()
+    
+    if not cluster_records:
         return EntityRiskResponse(
             user_id=user_id,
-            is_flagged=True,
-            risk_score=cluster_record.risk_score,
-            cluster_id=cluster_record.cluster_id,
-            cluster_size=2, # In V2 (GARG-AML), we will query actual size. For now, it exists = >1
-            reason=f"User is linked to Smurf Cluster: {cluster_record.cluster_id}"
+            is_flagged=False,
+            risk_score=0.0,
+            risk_level="SAFE",
+            cluster_id=None,
+            cluster_size=0,
+            reason="No entity links detected"
         )
     
-    # 2. User is clean (for now)
+    # User is in one or more clusters (take highest risk)
+    highest_risk_cluster = max(cluster_records, key=lambda c: c.risk_score)
+    
+    # Determine risk level
+    risk_score = highest_risk_cluster.risk_score
+    if risk_score >= 0.85:
+        risk_level = "CRITICAL"
+        is_flagged = True
+    elif risk_score >= 0.70:
+        risk_level = "HIGH"
+        is_flagged = True
+    elif risk_score >= 0.50:
+        risk_level = "MEDIUM"
+        is_flagged = True
+    else:
+        risk_level = "LOW"
+        is_flagged = False
+    
     return EntityRiskResponse(
         user_id=user_id,
-        is_flagged=False,
-        risk_score=0.0,
-        cluster_id=None,
-        cluster_size=0,
-        reason="No known entity links found"
+        is_flagged=is_flagged,
+        risk_score=risk_score,
+        risk_level=risk_level,
+        cluster_id=highest_risk_cluster.cluster_id,
+        cluster_size=highest_risk_cluster.cluster_size,
+        density_score=highest_risk_cluster.density_score,
+        confidence_score=highest_risk_cluster.confidence_score,
+        reason=f"User linked to {risk_level} risk cluster: {highest_risk_cluster.cluster_id}"
     )
+
+
+# ============================================================================
+# ENDPOINT 3: CLUSTER DETAILS (New)
+# ============================================================================
+
+@app.get("/api/v1/cluster/{cluster_id}", response_model=ClusterDetailsResponse)
+def get_cluster_details(cluster_id: str, db: Session = Depends(get_db)):
+    """
+    Get detailed information about a specific cluster.
+    Used by compliance officers for investigation.
+    """
+    members = db.query(SmurfCluster).filter(
+        SmurfCluster.cluster_id == cluster_id,
+        SmurfCluster.is_active == True
+    ).all()
+    
+    if not members:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    
+    # Get all user IDs in cluster
+    user_ids = [m.user_id for m in members]
+    
+    # Get entity links within cluster
+    links = db.query(EntityLink).filter(
+        EntityLink.user_a.in_(user_ids),
+        EntityLink.user_b.in_(user_ids),
+        EntityLink.is_active == True
+    ).all()
+    
+    # Format response
+    representative = members[0]
+    
+    return ClusterDetailsResponse(
+        cluster_id=cluster_id,
+        size=representative.cluster_size,
+        risk_score=representative.risk_score,
+        density_score=representative.density_score,
+        confidence_score=representative.confidence_score,
+        formation_date=representative.formation_date,
+        review_status=representative.review_status,
+        members=[
+            {
+                "user_id": m.user_id,
+                "risk_score": m.risk_score
+            }
+            for m in members
+        ],
+        connections=[
+            {
+                "user_a": link.user_a,
+                "user_b": link.user_b,
+                "confidence": link.adjusted_confidence,
+                "link_type": link.link_type,
+                "shared_signals": link.shared_signals
+            }
+            for link in links
+        ]
+    )
+
+
+# ============================================================================
+# ENDPOINT 4: COMPLIANCE DASHBOARD
+# ============================================================================
+
+@app.get("/api/v1/compliance/clusters")
+def get_flagged_clusters(
+    min_risk: float = Query(0.7, ge=0.0, le=1.0),
+    status: str = Query("PENDING"),
+    limit: int = Query(50, le=200),
+    db: Session = Depends(get_db)
+):
+    """
+    Get clusters for compliance review.
+    Filters by risk score and review status.
+    """
+    # Get unique clusters meeting criteria
+    clusters = db.query(
+        SmurfCluster.cluster_id,
+        func.max(SmurfCluster.risk_score).label('max_risk'),
+        func.max(SmurfCluster.cluster_size).label('size'),
+        func.max(SmurfCluster.formation_date).label('formed')
+    ).filter(
+        SmurfCluster.is_active == True,
+        SmurfCluster.risk_score >= min_risk,
+        SmurfCluster.review_status == status
+    ).group_by(
+        SmurfCluster.cluster_id
+    ).order_by(
+        func.max(SmurfCluster.risk_score).desc()
+    ).limit(limit).all()
+    
+    return {
+        "count": len(clusters),
+        "filters": {
+            "min_risk": min_risk,
+            "status": status
+        },
+        "clusters": [
+            {
+                "cluster_id": c.cluster_id,
+                "risk_score": c.max_risk,
+                "size": c.size,
+                "formation_date": c.formed.isoformat()
+            }
+            for c in clusters
+        ]
+    }
+
+
+# ============================================================================
+# ENDPOINT 5: SYSTEM HEALTH
+# ============================================================================
+
+@app.get("/api/v1/health", response_model=SystemHealthResponse)
+def health_check(db: Session = Depends(get_db)):
+    """
+    System health and statistics.
+    """
+    try:
+        # Get analysis state
+        state = db.query(AnalysisState).first()
+        
+        # Get statistics
+        total_metadata = db.query(func.count(UserMetadata.id)).scalar()
+        total_links = db.query(func.count(EntityLink.id)).filter(
+            EntityLink.is_active == True
+        ).scalar()
+        total_clusters = db.query(func.count(func.distinct(SmurfCluster.cluster_id))).filter(
+            SmurfCluster.is_active == True
+        ).scalar()
+        
+        high_risk_clusters = db.query(func.count(func.distinct(SmurfCluster.cluster_id))).filter(
+            SmurfCluster.is_active == True,
+            SmurfCluster.risk_score >= 0.85
+        ).scalar()
+        
+        return SystemHealthResponse(
+            status="healthy",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            version="2.0.0",
+            worker_status=state.worker_status if state else "UNKNOWN",
+            last_analysis=state.last_analysis_time.isoformat() if state else None,
+            statistics={
+                "total_metadata_records": total_metadata,
+                "active_entity_links": total_links,
+                "active_clusters": total_clusters,
+                "high_risk_clusters": high_risk_clusters,
+                "last_processed_id": state.last_processed_metadata_id if state else 0
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return SystemHealthResponse(
+            status="degraded",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            version="2.0.0",
+            worker_status="ERROR",
+            statistics={}
+        )
+
+
+# ============================================================================
+# ENDPOINT 6: MANUAL REVIEW (Compliance Tool)
+# ============================================================================
+
+@app.post("/api/v1/compliance/review/{cluster_id}")
+def review_cluster(
+    cluster_id: str,
+    decision: str = Query(..., regex="^(CONFIRMED|FALSE_POSITIVE)$"),
+    db: Session = Depends(get_db)
+):
+    """
+    Mark cluster as reviewed by compliance officer.
+    Decision: CONFIRMED (fraud) or FALSE_POSITIVE (legitimate)
+    """
+    updated = db.query(SmurfCluster).filter(
+        SmurfCluster.cluster_id == cluster_id
+    ).update({
+        "review_status": decision,
+        "manually_reviewed": True
+    })
+    
+    db.commit()
+    
+    if updated == 0:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    
+    return {
+        "status": "success",
+        "cluster_id": cluster_id,
+        "decision": decision,
+        "message": f"Cluster marked as {decision}"
+    }
+
+
+# ============================================================================
+# ROOT
+# ============================================================================
 
 @app.get("/")
 def home():
-    return {"message": "Entity Resolution Spider is Active"}
+    return {
+        "message": "Entity Resolution Engine (GARG-AML Enhanced)",
+        "version": "2.0.0",
+        "status": "operational",
+        "features": [
+            "Multi-layered confidence scoring",
+            "Temporal decay analysis",
+            "Signal strength weighting",
+            "GARG-AML density metrics",
+            "Incremental graph processing"
+        ],
+        "endpoints": {
+            "ingest": "POST /api/v1/ingest/user-metadata",
+            "risk_check": "GET /api/v1/user/{user_id}/risk",
+            "cluster_details": "GET /api/v1/cluster/{cluster_id}",
+            "compliance_dashboard": "GET /api/v1/compliance/clusters",
+            "manual_review": "POST /api/v1/compliance/review/{cluster_id}",
+            "health": "GET /api/v1/health"
+        }
+    }
