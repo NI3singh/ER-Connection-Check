@@ -1,0 +1,21 @@
+[Unit]
+Description=AML Entity Resolution Worker
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/your/project
+Environment="PATH=/path/to/your/venv/bin"
+ExecStart=/path/to/your/venv/bin/python worker.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/var/log/aml-worker.log
+StandardError=append:/var/log/aml-worker-error.log
+
+[Install]
+WantedBy=multi-user.target

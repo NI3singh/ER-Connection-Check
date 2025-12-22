@@ -1,0 +1,77 @@
+========================================
+AML Entity Resolution - Installation
+========================================
+
+OPTION 1: Automatic Setup (Recommended)
+----------------------------------------
+chmod +x setup.sh
+./setup.sh
+
+This will:
+- Initialize database and create tables
+- Optionally setup systemd service for worker
+- Give you final commands to run
+
+
+OPTION 2: Manual Setup (3 Commands)
+------------------------------------
+1. Initialize database:
+   python database.py
+
+2. Start API:
+   uvicorn main:app --host 0.0.0.0 --port 8001
+
+3. Start Worker:
+   python worker.py
+
+
+OPTION 3: Production Setup (With Systemd)
+------------------------------------------
+1. Initialize database:
+   python database.py
+
+2. Setup worker service:
+   # Edit aml-worker.service file:
+   # - Replace YOUR_USERNAME with your username
+   # - Replace /path/to/your/project with actual path
+   # - Replace /path/to/your/venv with actual venv path
+   
+   sudo cp aml-worker.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable aml-worker
+   sudo systemctl start aml-worker
+
+3. Start API:
+   uvicorn main:app --host 0.0.0.0 --port 8001
+
+
+Verify Installation
+-------------------
+curl http://localhost:8001/api/v1/health
+
+Expected output:
+{
+  "status": "healthy",
+  "worker_status": "IDLE",
+  ...
+}
+
+
+Service Management (If using systemd)
+--------------------------------------
+Start:   sudo systemctl start aml-worker
+Stop:    sudo systemctl stop aml-worker
+Status:  sudo systemctl status aml-worker
+Logs:    sudo journalctl -u aml-worker -f
+
+
+Troubleshooting
+---------------
+Issue: "DATABASE_URL not found"
+Fix: Create .env file with DATABASE_URL
+
+Issue: "Module not found"
+Fix: Activate virtual environment or install requirements.txt
+
+Issue: Worker not processing
+Fix: Check logs with: sudo journalctl -u aml-worker -f
