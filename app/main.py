@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 from app.database import get_db, init_database
@@ -13,6 +13,9 @@ from app.schemas import (
 )
 from datetime import datetime, timezone
 import logging
+from app.rate_limiter import limiter, rate_limit_exceeded_handler
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.errors import RateLimitExceeded
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +29,10 @@ app = FastAPI(
     description="Multi-layered graph-based fraud detection with confidence scoring"
 )
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 # Auto-create tables on startup
 @app.on_event("startup")
 def startup_event():
@@ -38,60 +45,9 @@ def startup_event():
 # ENDPOINT 1: METADATA INGESTION (with UPSERT)
 # ============================================================================
 
-# @app.post("/api/v1/ingest/user-metadata", response_model=IngestionResponse)
-# def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get_db)):
-#     """
-#     Ingest user fingerprints with UPSERT logic to prevent duplicates.
-    
-#     CRITICAL: Uses composite unique constraint to ensure one row per unique
-#     user-fingerprint combination.
-#     """
-#     try:
-#         # UPSERT Logic: Check if this exact combination exists
-#         existing = db.query(UserMetadata).filter(
-#             and_(
-#                 UserMetadata.user_id == request.user_id,
-#                 UserMetadata.device_hash == request.device_hash,
-#                 UserMetadata.ip_address == request.ip_address,
-#                 UserMetadata.canvas_hash == request.canvas_hash
-#             )
-#         ).first()
-        
-#         if existing:
-#             # UPDATE: Increment occurrence count and update last_seen
-#             existing.occurrence_count += 1
-#             existing.last_seen = datetime.now(timezone.utc)
-#             action = "updated"
-            
-#             logger.info(f"Metadata updated for user: {request.user_id} (seen {existing.occurrence_count}x)")
-#         else:
-#             # INSERT: Create new metadata record
-#             metadata_entry = UserMetadata(
-#                 user_id=request.user_id,
-#                 device_hash=request.device_hash,
-#                 ip_address=request.ip_address,
-#                 canvas_hash=request.canvas_hash,
-#                 occurrence_count=1
-#             )
-#             db.add(metadata_entry)
-#             action = "created"
-            
-#             logger.info(f"Metadata created for user: {request.user_id}")
-        
-#         db.commit()
-        
-#         return IngestionResponse(
-#             status="success",
-#             message=f"Metadata {action} and queued for analysis"
-#         )
-
-#     except Exception as e:
-#         logger.error(f"Ingestion failed: {e}", exc_info=True)
-#         db.rollback()
-#         raise HTTPException(status_code=500, detail="Internal Server Error")
-
 @app.post("/api/v1/ingest/user-metadata", response_model=IngestionResponse)
-def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get_db)):
+@limiter.limit("100/minute")
+def ingest_user_metadata(request_data: UserMetadataRequest, request: Request, response: Response, db: Session = Depends(get_db)):
     """
     Ingest user fingerprints with atomic UPSERT to prevent race conditions.
     """
@@ -100,10 +56,10 @@ def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get
         
         # Prepare values
         values = {
-            'user_id': request.user_id,
-            'device_hash': request.device_hash or 'NONE',
-            'ip_address': request.ip_address or 'NONE',
-            'canvas_hash': request.canvas_hash or 'NONE',
+            'user_id': request_data.user_id,
+            'device_hash': request_data.device_hash or 'NONE',
+            'ip_address': request_data.ip_address or 'NONE',
+            'canvas_hash': request_data.canvas_hash or 'NONE',
             'occurrence_count': 1,
             'first_seen': datetime.now(timezone.utc),
             'last_seen': datetime.now(timezone.utc)
@@ -125,7 +81,7 @@ def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get
         # Check if it was insert or update
         if result.rowcount > 0:
             action = "created or updated"
-            logger.info(f"Metadata ingested for user: {request.user_id}")
+            logger.info(f"Metadata ingested for user: {request_data.user_id}")
         
         return IngestionResponse(
             status="success",
@@ -359,35 +315,6 @@ def health_check(db: Session = Depends(get_db)):
 # ============================================================================
 # ENDPOINT 6: MANUAL REVIEW (Compliance Tool)
 # ============================================================================
-
-# @app.post("/api/v1/compliance/review/{cluster_id}")
-# def review_cluster(
-#     cluster_id: str,
-#     decision: str = Query(..., regex="^(CONFIRMED|FALSE_POSITIVE)$"),
-#     db: Session = Depends(get_db)
-# ):
-#     """
-#     Mark cluster as reviewed by compliance officer.
-#     Decision: CONFIRMED (fraud) or FALSE_POSITIVE (legitimate)
-#     """
-#     updated = db.query(SmurfCluster).filter(
-#         SmurfCluster.cluster_id == cluster_id
-#     ).update({
-#         "review_status": decision,
-#         "manually_reviewed": True
-#     })
-    
-#     db.commit()
-    
-#     if updated == 0:
-#         raise HTTPException(status_code=404, detail="Cluster not found")
-    
-#     return {
-#         "status": "success",
-#         "cluster_id": cluster_id,
-#         "decision": decision,
-#         "message": f"Cluster marked as {decision}"
-#     }
 
 @app.post("/api/v1/compliance/review/{cluster_id}")
 def review_cluster(
