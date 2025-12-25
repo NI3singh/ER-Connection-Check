@@ -1,5 +1,6 @@
+from importlib.metadata import metadata
 import networkx as nx
-from app.models import UserMetadata, EntityLink, SmurfCluster, SignalStrength, AnalysisState
+from app.models import FailedMetadataProcessing, UserMetadata, EntityLink, SmurfCluster, SignalStrength, AnalysisState
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime, timedelta, timezone
@@ -116,6 +117,75 @@ class SignalAnalyzer:
         self.db.commit()
         logger.info("Signal strengths updated.")
 
+    def update_signal_strengths_incremental(self, new_metadata_ids: list):
+        """
+        Recalculates confidence weights only for signals in new metadata.
+        Much faster than full recalculation.
+        """
+        if not new_metadata_ids:
+            return
+        
+        logger.info(f"Updating signal strengths for {len(new_metadata_ids)} new records...")
+        
+        # Get unique signals from new metadata
+        new_metadata = self.db.query(UserMetadata).filter(
+            UserMetadata.id.in_(new_metadata_ids)
+        ).all()
+        
+        affected_signals = set()
+        for meta in new_metadata:
+            if meta.device_hash and meta.device_hash != 'NONE':
+                affected_signals.add(('DEVICE', meta.device_hash))
+            if meta.canvas_hash and meta.canvas_hash != 'NONE':
+                affected_signals.add(('CANVAS', meta.canvas_hash))
+            if meta.ip_address and meta.ip_address != 'NONE':
+                affected_signals.add(('IP', meta.ip_address))
+        
+        # Update only affected signals
+        for signal_type, signal_value in affected_signals:
+            col_name = signal_type.lower() + '_hash' if signal_type != 'IP' else 'ip_address'
+            
+            # Count users for this specific signal
+            user_count = self.db.query(func.count(func.distinct(UserMetadata.user_id))).filter(
+                getattr(UserMetadata, col_name) == signal_value
+            ).scalar()
+            
+            # Calculate confidence weight
+            base_weight = self.config.SIGNAL_WEIGHTS[signal_type]
+            
+            if signal_type == 'IP':
+                if user_count >= self.config.PUBLIC_IP_THRESHOLD:
+                    weight = 0.05
+                elif user_count >= self.config.MAX_USERS_PER_IP:
+                    weight = 0.15
+                else:
+                    weight = base_weight
+            else:
+                if user_count > 5:
+                    weight = base_weight * (1 / (1 + user_count * 0.1))
+                else:
+                    weight = base_weight
+            
+            # UPSERT signal strength
+            existing = self.db.query(SignalStrength).filter_by(
+                signal_type=signal_type,
+                signal_value=signal_value
+            ).first()
+            
+            if existing:
+                existing.user_count = user_count
+                existing.confidence_weight = weight
+            else:
+                self.db.add(SignalStrength(
+                    signal_type=signal_type,
+                    signal_value=signal_value,
+                    user_count=user_count,
+                    confidence_weight=weight
+                ))
+        
+        self.db.commit()
+        logger.info(f"Updated {len(affected_signals)} signal strengths")
+
 
 # ============================================================================
 # LAYER 2: TEMPORAL LINK BUILDER
@@ -131,6 +201,38 @@ class LinkBuilder:
         # key: (user_a, user_b) (ordered tuple), value: EntityLink ORM object
         self._pending_links = {}
 
+    # def build_links_incremental(self, last_processed_id: int):
+    #     logger.info(f"Building links from metadata ID {last_processed_id}...")
+
+    #     new_metadata = self.db.query(UserMetadata).filter(
+    #         UserMetadata.id > last_processed_id
+    #     ).all()
+
+    #     if not new_metadata:
+    #         logger.info("No new metadata to process.")
+    #         return
+
+    #     self._pending_links = {}
+    #     links_created = 0
+
+    #     for new_meta in new_metadata:
+    #         potential_links = self._find_shared_signals(new_meta)
+
+    #         for other_user_id, shared_signals, confidence in potential_links:
+    #             if confidence >= self.config.MIN_LINK_CONFIDENCE:
+    #                 created_or_updated = self._create_or_update_link(
+    #                     new_meta.user_id,
+    #                     other_user_id,
+    #                     shared_signals,
+    #                     confidence
+    #                 )
+    #                 if created_or_updated:
+    #                     links_created += 1
+
+    #     # commit once after de-duplicated updates/adds
+    #     self.db.commit()
+    #     logger.info(f"Created/updated {links_created} links.")
+    
     def build_links_incremental(self, last_processed_id: int):
         logger.info(f"Building links from metadata ID {last_processed_id}...")
 
@@ -144,58 +246,142 @@ class LinkBuilder:
 
         self._pending_links = {}
         links_created = 0
+        failed_ids = []  # Dead letter queue
 
         for new_meta in new_metadata:
-            potential_links = self._find_shared_signals(new_meta)
+            try:
+                potential_links = self._find_shared_signals(new_meta)
 
-            for other_user_id, shared_signals, confidence in potential_links:
-                if confidence >= self.config.MIN_LINK_CONFIDENCE:
-                    created_or_updated = self._create_or_update_link(
-                        new_meta.user_id,
-                        other_user_id,
-                        shared_signals,
-                        confidence
-                    )
-                    if created_or_updated:
-                        links_created += 1
+                for other_user_id, shared_signals, confidence in potential_links:
+                    if confidence >= self.config.MIN_LINK_CONFIDENCE:
+                        created_or_updated = self._create_or_update_link(
+                            new_meta.user_id,
+                            other_user_id,
+                            shared_signals,
+                            confidence
+                        )
+                        if created_or_updated:
+                            links_created += 1
+            
+            except Exception as e:
+                # Log error but continue processing other records
+                logger.error(f"Failed to process metadata ID {new_meta.id} (user: {new_meta.user_id}): {e}", exc_info=True)
+                failed_ids.append(new_meta.id)
+
+                # Record in dead letter queue
+                import traceback
+                dlq_entry = FailedMetadataProcessing(
+                    metadata_id=new_meta.id,
+                    user_id=new_meta.user_id,
+                    error_message=str(e)[:500],  # Limit length
+                    error_traceback=traceback.format_exc()
+                )
+                self.db.add(dlq_entry)
+
+                continue  # Don't let one bad record block everything
 
         # commit once after de-duplicated updates/adds
-        self.db.commit()
-        logger.info(f"Created/updated {links_created} links.")
-    
+        try:
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Failed to commit links: {e}")
+            self.db.rollback()
+            raise
+        
+        if failed_ids:
+            logger.warning(f"Failed to process {len(failed_ids)} metadata records: {failed_ids}")
+        
+        logger.info(f"Created/updated {links_created} links. Failed: {len(failed_ids)} records.")
+
+    # def _find_shared_signals(self, metadata: UserMetadata):
+    #     """
+    #     Find other users who share signals with this user.
+    #     Returns: [(user_id, shared_signals, confidence)]
+    #     """
+    #     results = []
+        
+    #     # Query for users sharing device
+    #     # if metadata.device_hash:
+    #     if metadata.device_hash and metadata.device_hash != 'NONE':
+    #         device_matches = self.db.query(UserMetadata).filter(
+    #             UserMetadata.device_hash == metadata.device_hash,
+    #             UserMetadata.user_id != metadata.user_id
+    #         ).all()
+            
+    #         for match in device_matches:
+    #             shared_signals = self._calculate_shared_signals(metadata, match)
+    #             confidence = self._calculate_confidence(shared_signals, metadata, match)
+    #             results.append((match.user_id, shared_signals, confidence))
+        
+    #     # Query for users sharing canvas
+    #     # if metadata.canvas_hash:
+    #     if metadata.canvas_hash and metadata.canvas_hash != 'NONE':
+    #         canvas_matches = self.db.query(UserMetadata).filter(
+    #             UserMetadata.canvas_hash == metadata.canvas_hash,
+    #             UserMetadata.user_id != metadata.user_id
+    #         ).all()
+            
+    #         for match in canvas_matches:
+    #             if match.user_id not in [r[0] for r in results]:  # Avoid duplicates
+    #                 shared_signals = self._calculate_shared_signals(metadata, match)
+    #                 confidence = self._calculate_confidence(shared_signals, metadata, match)
+    #                 results.append((match.user_id, shared_signals, confidence))
+        
+    #     # Skip IP-only matches (too many false positives)
+        
+    #     return results
+
     def _find_shared_signals(self, metadata: UserMetadata):
         """
         Find other users who share signals with this user.
         Returns: [(user_id, shared_signals, confidence)]
         """
-        results = []
+        # Use dict to merge all signals for each user
+        signal_map = {}  # {user_id: {UserMetadata object, set_of_signal_types}}
         
         # Query for users sharing device
-        if metadata.device_hash:
+        if metadata.device_hash and metadata.device_hash != 'NONE':
             device_matches = self.db.query(UserMetadata).filter(
                 UserMetadata.device_hash == metadata.device_hash,
                 UserMetadata.user_id != metadata.user_id
             ).all()
             
             for match in device_matches:
-                shared_signals = self._calculate_shared_signals(metadata, match)
-                confidence = self._calculate_confidence(shared_signals, metadata, match)
-                results.append((match.user_id, shared_signals, confidence))
+                if match.user_id not in signal_map:
+                    signal_map[match.user_id] = {'metadata': match, 'signals': set()}
+                signal_map[match.user_id]['signals'].add('DEVICE')
         
         # Query for users sharing canvas
-        if metadata.canvas_hash:
+        if metadata.canvas_hash and metadata.canvas_hash != 'NONE':
             canvas_matches = self.db.query(UserMetadata).filter(
                 UserMetadata.canvas_hash == metadata.canvas_hash,
                 UserMetadata.user_id != metadata.user_id
             ).all()
             
             for match in canvas_matches:
-                if match.user_id not in [r[0] for r in results]:  # Avoid duplicates
-                    shared_signals = self._calculate_shared_signals(metadata, match)
-                    confidence = self._calculate_confidence(shared_signals, metadata, match)
-                    results.append((match.user_id, shared_signals, confidence))
+                if match.user_id not in signal_map:
+                    signal_map[match.user_id] = {'metadata': match, 'signals': set()}
+                signal_map[match.user_id]['signals'].add('CANVAS')
         
-        # Skip IP-only matches (too many false positives)
+        # Query for users sharing IP (will be used only as confidence booster)
+        if metadata.ip_address and metadata.ip_address != 'NONE':
+            ip_matches = self.db.query(UserMetadata).filter(
+                UserMetadata.ip_address == metadata.ip_address,
+                UserMetadata.user_id != metadata.user_id
+            ).all()
+            
+            for match in ip_matches:
+                # Only add IP if user already has DEVICE or CANVAS match
+                if match.user_id in signal_map:
+                    signal_map[match.user_id]['signals'].add('IP')
+        
+        # Calculate confidence for each matched user with MERGED signals
+        results = []
+        for user_id, data in signal_map.items():
+            shared_signals = list(data['signals'])
+            match_metadata = data['metadata']
+            confidence = self._calculate_confidence(shared_signals, metadata, match_metadata)
+            results.append((user_id, shared_signals, confidence))
         
         return results
     
@@ -294,7 +480,8 @@ class LinkBuilder:
         if pair in self._pending_links:
             existing = self._pending_links[pair]
             # update fields
-            existing.shared_signals = json.dumps(shared_signals)
+            # existing.shared_signals = json.dumps(shared_signals)
+            existing.shared_signals = shared_signals
             existing.adjusted_confidence = confidence
             existing.raw_confidence = confidence
             existing.link_type = "PRIMARY" if confidence >= self.config.HIGH_CONFIDENCE_THRESHOLD else (
@@ -311,7 +498,8 @@ class LinkBuilder:
         )
 
         if existing:
-            existing.shared_signals = json.dumps(shared_signals)
+            # existing.shared_signals = json.dumps(shared_signals)
+            existing.shared_signals = shared_signals
             existing.adjusted_confidence = confidence
             existing.raw_confidence = confidence
             existing.link_type = link_type
@@ -324,7 +512,8 @@ class LinkBuilder:
         new_link = EntityLink(
             user_a=user_a,
             user_b=user_b,
-            shared_signals=json.dumps(shared_signals),
+            # shared_signals=json.dumps(shared_signals),
+            shared_signals=shared_signals,
             link_type=link_type,
             raw_confidence=confidence,
             adjusted_confidence=confidence,
@@ -347,26 +536,55 @@ class GARGClusterDetector:
         self.config = GARGConfig()
         self.graph = nx.Graph()
     
+    # def build_graph_from_links(self):
+    #     """Build graph from entity links (not raw metadata)"""
+    #     logger.info("Building graph from entity links...")
+        
+    #     # Get only active, high-confidence links
+    #     links = self.db.query(EntityLink).filter(
+    #         EntityLink.is_active == True,
+    #         EntityLink.adjusted_confidence >= self.config.MIN_LINK_CONFIDENCE
+    #     ).all()
+        
+    #     for link in links:
+    #         self.graph.add_edge(
+    #             link.user_a,
+    #             link.user_b,
+    #             confidence=link.adjusted_confidence,
+    #             signals=link.shared_signals
+    #         )
+        
+    #     logger.info(f"Graph built: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
+    
     def build_graph_from_links(self):
-        """Build graph from entity links (not raw metadata)"""
+        """Build graph from entity links with real-time temporal decay"""
         logger.info("Building graph from entity links...")
         
-        # Get only active, high-confidence links
+        # Get only active links
         links = self.db.query(EntityLink).filter(
-            EntityLink.is_active == True,
-            EntityLink.adjusted_confidence >= self.config.MIN_LINK_CONFIDENCE
+            EntityLink.is_active == True
         ).all()
         
         for link in links:
-            self.graph.add_edge(
-                link.user_a,
-                link.user_b,
-                confidence=link.adjusted_confidence,
-                signals=link.shared_signals
-            )
+            # Recalculate confidence with current temporal decay
+            current_confidence = self._recalculate_temporal_decay(link)
+            
+            # Only add to graph if confidence still meets threshold
+            if current_confidence >= self.config.MIN_LINK_CONFIDENCE:
+                self.graph.add_edge(
+                    link.user_a,
+                    link.user_b,
+                    confidence=current_confidence,
+                    signals=link.shared_signals
+                )
+            else:
+                # Mark link as inactive if it decayed too much
+                link.is_active = False
+        
+        self.db.commit()
         
         logger.info(f"Graph built: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
-    
+
     def detect_clusters(self):
         """
         Detect clusters using connected components.
@@ -412,7 +630,9 @@ class GARGClusterDetector:
         # 3. Shared Signals Analysis
         all_signals = set()
         for _, _, data in subgraph.edges(data=True):
-            signals = json.loads(data['signals'])
+            # signals = json.loads(data['signals'])
+            signals = data['signals']
+            signals = data['signals'] if isinstance(data['signals'], list) else json.loads(data['signals'])
             all_signals.update(signals)
         
         # 4. Risk Score (GARG-AML Formula)
@@ -430,6 +650,24 @@ class GARGClusterDetector:
             'shared_signals': list(all_signals)
         }
     
+    def _recalculate_temporal_decay(self, link: EntityLink) -> float:
+        """
+        Recalculate temporal decay for a link based on current time.
+        """
+        age_days = (datetime.now(timezone.utc) - link.first_linked).days
+        
+        if age_days < self.config.DECAY_START_DAYS:
+            return link.raw_confidence
+        
+        if age_days >= self.config.CONNECTION_MAX_AGE_DAYS:
+            return 0.0
+        
+        # Linear decay from DECAY_START to MAX_AGE
+        decay_window = self.config.CONNECTION_MAX_AGE_DAYS - self.config.DECAY_START_DAYS
+        decay_amount = (age_days - self.config.DECAY_START_DAYS) / decay_window
+        
+        return link.raw_confidence * (1 - decay_amount * 0.7)  # Max 70% decay
+        
     def save_clusters(self, clusters):
         """Save detected clusters to database"""
         logger.info(f"Saving {len(clusters)} clusters...")
@@ -458,7 +696,9 @@ class GARGClusterDetector:
                     existing.density_score = cluster['density']
                     existing.confidence_score = cluster['avg_confidence']
                     existing.risk_score = cluster['risk_score']
-                    existing.shared_signals = json.dumps(cluster['shared_signals'])
+                    # existing.shared_signals = json.dumps(cluster['shared_signals'])
+                    existing.shared_signals = cluster['shared_signals']
+
                     # Keep formation_date (historical record)
                     # Keep manually_reviewed and review_status (compliance decision)
                 else:
@@ -470,7 +710,8 @@ class GARGClusterDetector:
                         density_score=cluster['density'],
                         confidence_score=cluster['avg_confidence'],
                         risk_score=cluster['risk_score'],
-                        shared_signals=json.dumps(cluster['shared_signals']),
+                        # shared_signals=json.dumps(cluster['shared_signals']),
+                        shared_signals=cluster['shared_signals'],
                         is_active=True,
                         review_status="PENDING"
                     ))
@@ -509,9 +750,19 @@ class GraphAnalyzer:
             
             last_id = state.last_processed_metadata_id
             
-            # Layer 1: Update signal strengths
-            self.signal_analyzer.update_signal_strengths()
+            # # Layer 1: Update signal strengths
+            # self.signal_analyzer.update_signal_strengths()
             
+            # # Layer 2: Build links incrementally
+            # self.link_builder.build_links_incremental(last_id)
+
+            # Get new metadata IDs
+            latest_id = self.db.query(func.max(UserMetadata.id)).scalar() or 0
+            new_metadata_ids = list(range(last_id + 1, latest_id + 1))
+
+            # Layer 1: Update signal strengths (incremental)
+            self.signal_analyzer.update_signal_strengths_incremental(new_metadata_ids)
+
             # Layer 2: Build links incrementally
             self.link_builder.build_links_incremental(last_id)
             

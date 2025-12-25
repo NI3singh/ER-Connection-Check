@@ -8,7 +8,8 @@ from app.schemas import (
     IngestionResponse, 
     EntityRiskResponse,
     ClusterDetailsResponse,
-    SystemHealthResponse
+    SystemHealthResponse,
+    ClusterReviewRequest
 )
 from datetime import datetime, timezone
 import logging
@@ -37,47 +38,94 @@ def startup_event():
 # ENDPOINT 1: METADATA INGESTION (with UPSERT)
 # ============================================================================
 
+# @app.post("/api/v1/ingest/user-metadata", response_model=IngestionResponse)
+# def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get_db)):
+#     """
+#     Ingest user fingerprints with UPSERT logic to prevent duplicates.
+    
+#     CRITICAL: Uses composite unique constraint to ensure one row per unique
+#     user-fingerprint combination.
+#     """
+#     try:
+#         # UPSERT Logic: Check if this exact combination exists
+#         existing = db.query(UserMetadata).filter(
+#             and_(
+#                 UserMetadata.user_id == request.user_id,
+#                 UserMetadata.device_hash == request.device_hash,
+#                 UserMetadata.ip_address == request.ip_address,
+#                 UserMetadata.canvas_hash == request.canvas_hash
+#             )
+#         ).first()
+        
+#         if existing:
+#             # UPDATE: Increment occurrence count and update last_seen
+#             existing.occurrence_count += 1
+#             existing.last_seen = datetime.now(timezone.utc)
+#             action = "updated"
+            
+#             logger.info(f"Metadata updated for user: {request.user_id} (seen {existing.occurrence_count}x)")
+#         else:
+#             # INSERT: Create new metadata record
+#             metadata_entry = UserMetadata(
+#                 user_id=request.user_id,
+#                 device_hash=request.device_hash,
+#                 ip_address=request.ip_address,
+#                 canvas_hash=request.canvas_hash,
+#                 occurrence_count=1
+#             )
+#             db.add(metadata_entry)
+#             action = "created"
+            
+#             logger.info(f"Metadata created for user: {request.user_id}")
+        
+#         db.commit()
+        
+#         return IngestionResponse(
+#             status="success",
+#             message=f"Metadata {action} and queued for analysis"
+#         )
+
+#     except Exception as e:
+#         logger.error(f"Ingestion failed: {e}", exc_info=True)
+#         db.rollback()
+#         raise HTTPException(status_code=500, detail="Internal Server Error")
+
 @app.post("/api/v1/ingest/user-metadata", response_model=IngestionResponse)
 def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get_db)):
     """
-    Ingest user fingerprints with UPSERT logic to prevent duplicates.
-    
-    CRITICAL: Uses composite unique constraint to ensure one row per unique
-    user-fingerprint combination.
+    Ingest user fingerprints with atomic UPSERT to prevent race conditions.
     """
     try:
-        # UPSERT Logic: Check if this exact combination exists
-        existing = db.query(UserMetadata).filter(
-            and_(
-                UserMetadata.user_id == request.user_id,
-                UserMetadata.device_hash == request.device_hash,
-                UserMetadata.ip_address == request.ip_address,
-                UserMetadata.canvas_hash == request.canvas_hash
-            )
-        ).first()
+        from sqlalchemy.dialects.postgresql import insert
         
-        if existing:
-            # UPDATE: Increment occurrence count and update last_seen
-            existing.occurrence_count += 1
-            existing.last_seen = datetime.now(timezone.utc)
-            action = "updated"
-            
-            logger.info(f"Metadata updated for user: {request.user_id} (seen {existing.occurrence_count}x)")
-        else:
-            # INSERT: Create new metadata record
-            metadata_entry = UserMetadata(
-                user_id=request.user_id,
-                device_hash=request.device_hash,
-                ip_address=request.ip_address,
-                canvas_hash=request.canvas_hash,
-                occurrence_count=1
-            )
-            db.add(metadata_entry)
-            action = "created"
-            
-            logger.info(f"Metadata created for user: {request.user_id}")
+        # Prepare values
+        values = {
+            'user_id': request.user_id,
+            'device_hash': request.device_hash or 'NONE',
+            'ip_address': request.ip_address or 'NONE',
+            'canvas_hash': request.canvas_hash or 'NONE',
+            'occurrence_count': 1,
+            'first_seen': datetime.now(timezone.utc),
+            'last_seen': datetime.now(timezone.utc)
+        }
         
+        # Atomic UPSERT using PostgreSQL's ON CONFLICT
+        stmt = insert(UserMetadata).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            constraint='uq_user_fingerprint',
+            set_={
+                'occurrence_count': UserMetadata.occurrence_count + 1,
+                'last_seen': datetime.now(timezone.utc)
+            }
+        )
+        
+        result = db.execute(stmt)
         db.commit()
+        
+        # Check if it was insert or update
+        if result.rowcount > 0:
+            action = "created or updated"
+            logger.info(f"Metadata ingested for user: {request.user_id}")
         
         return IngestionResponse(
             status="success",
@@ -88,7 +136,6 @@ def ingest_user_metadata(request: UserMetadataRequest, db: Session = Depends(get
         logger.error(f"Ingestion failed: {e}", exc_info=True)
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal Server Error")
-
 
 # ============================================================================
 # ENDPOINT 2: USER RISK CHECK 
@@ -313,33 +360,117 @@ def health_check(db: Session = Depends(get_db)):
 # ENDPOINT 6: MANUAL REVIEW (Compliance Tool)
 # ============================================================================
 
+# @app.post("/api/v1/compliance/review/{cluster_id}")
+# def review_cluster(
+#     cluster_id: str,
+#     decision: str = Query(..., regex="^(CONFIRMED|FALSE_POSITIVE)$"),
+#     db: Session = Depends(get_db)
+# ):
+#     """
+#     Mark cluster as reviewed by compliance officer.
+#     Decision: CONFIRMED (fraud) or FALSE_POSITIVE (legitimate)
+#     """
+#     updated = db.query(SmurfCluster).filter(
+#         SmurfCluster.cluster_id == cluster_id
+#     ).update({
+#         "review_status": decision,
+#         "manually_reviewed": True
+#     })
+    
+#     db.commit()
+    
+#     if updated == 0:
+#         raise HTTPException(status_code=404, detail="Cluster not found")
+    
+#     return {
+#         "status": "success",
+#         "cluster_id": cluster_id,
+#         "decision": decision,
+#         "message": f"Cluster marked as {decision}"
+#     }
+
 @app.post("/api/v1/compliance/review/{cluster_id}")
 def review_cluster(
     cluster_id: str,
-    decision: str = Query(..., regex="^(CONFIRMED|FALSE_POSITIVE)$"),
+    request: ClusterReviewRequest = ...,  # Now using schema
     db: Session = Depends(get_db)
 ):
     """
-    Mark cluster as reviewed by compliance officer.
-    Decision: CONFIRMED (fraud) or FALSE_POSITIVE (legitimate)
+    Mark cluster as reviewed by compliance officer with audit trail.
     """
+    from app.models import ClusterReviewAudit
+    from fastapi import Request as FastAPIRequest
+    
+    # Get current status before update
+    current_cluster = db.query(SmurfCluster).filter(
+        SmurfCluster.cluster_id == cluster_id
+    ).first()
+    
+    if not current_cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    
+    previous_status = current_cluster.review_status
+    
+    # Update cluster status
     updated = db.query(SmurfCluster).filter(
         SmurfCluster.cluster_id == cluster_id
     ).update({
-        "review_status": decision,
+        "review_status": request.decision,
         "manually_reviewed": True
     })
-    
-    db.commit()
     
     if updated == 0:
         raise HTTPException(status_code=404, detail="Cluster not found")
     
+    # Create audit record
+    audit = ClusterReviewAudit(
+        cluster_id=cluster_id,
+        reviewer_id=request.reviewer_id,
+        reviewer_ip=None,  # Could extract from FastAPI Request if needed
+        previous_status=previous_status,
+        new_status=request.decision,
+        reason=request.reason
+    )
+    db.add(audit)
+    
+    db.commit()
+    
+    logger.info(f"Cluster {cluster_id} reviewed: {previous_status} â†’ {request.decision} by {request.reviewer_id}")
+    
     return {
         "status": "success",
         "cluster_id": cluster_id,
-        "decision": decision,
-        "message": f"Cluster marked as {decision}"
+        "decision": request.decision,
+        "previous_status": previous_status,
+        "message": f"Cluster marked as {request.decision}"
+    }
+
+
+@app.get("/api/v1/compliance/audit/{cluster_id}")
+def get_cluster_audit_history(cluster_id: str, db: Session = Depends(get_db)):
+    """
+    Get full audit history for a cluster.
+    Shows all review decisions made over time.
+    """
+    from app.models import ClusterReviewAudit
+    
+    audits = db.query(ClusterReviewAudit).filter(
+        ClusterReviewAudit.cluster_id == cluster_id
+    ).order_by(ClusterReviewAudit.reviewed_at.desc()).all()
+    
+    return {
+        "cluster_id": cluster_id,
+        "audit_count": len(audits),
+        "history": [
+            {
+                "reviewer_id": a.reviewer_id,
+                "previous_status": a.previous_status,
+                "new_status": a.new_status,
+                "reason": a.reason,
+                "reviewed_at": a.reviewed_at.isoformat()
+            }
+            for a in audits
+        ]
     }
 
 

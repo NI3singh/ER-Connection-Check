@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Index, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.sql import func
 from app.db_base import Base
 
@@ -17,9 +18,13 @@ class UserMetadata(Base):
     user_id = Column(String, nullable=False)
     
     # Digital fingerprints
-    device_hash = Column(String, nullable=True)
-    ip_address = Column(String, nullable=True)
-    canvas_hash = Column(String, nullable=True)
+    # device_hash = Column(String, nullable=True)
+    # ip_address = Column(String, nullable=True)
+    # canvas_hash = Column(String, nullable=True)
+
+    device_hash = Column(String, nullable=False, default='NONE')
+    ip_address = Column(String, nullable=False, default='NONE')
+    canvas_hash = Column(String, nullable=False, default='NONE')
     
     # Temporal tracking
     first_seen = Column(DateTime(timezone=True), server_default=func.now())
@@ -94,7 +99,8 @@ class EntityLink(Base):
     user_b = Column(String, nullable=False)
     
     # Multi-signal tracking
-    shared_signals = Column(String, nullable=False)  # JSON: ["DEVICE", "CANVAS"]
+    # shared_signals = Column(String, nullable=False)  # JSON: ["DEVICE", "CANVAS"]
+    shared_signals = Column(JSON, nullable=False)  # Native JSON array
     link_type = Column(String, nullable=False)  # PRIMARY, SECONDARY, TERTIARY
     
     # Confidence scoring
@@ -141,7 +147,8 @@ class SmurfCluster(Base):
     risk_score = Column(Float, default=0.0)             # Final composite score
     
     # Cluster characteristics
-    shared_signals = Column(String, nullable=True)      # JSON: signal types shared
+    # shared_signals = Column(String, nullable=True)      # JSON: signal types shared
+    shared_signals = Column(JSON, nullable=True)  # Native JSON array
     formation_date = Column(DateTime(timezone=True), server_default=func.now())
     
     # Status management
@@ -163,9 +170,41 @@ class SmurfCluster(Base):
     def __repr__(self):
         return f"<Cluster({self.cluster_id}, user={self.user_id}, risk={self.risk_score:.2f}, status={self.review_status})>"
 
-
 # ============================================================================
-# LAYER 5: ANALYSIS STATE (Worker Management)
+# LAYER 5: AUDIT: CLUSTER REVIEW HISTORY
+# ============================================================================
+
+class ClusterReviewAudit(Base):
+    """
+    Audit trail for compliance team decisions on clusters.
+    """
+    __tablename__ = "cluster_review_audit"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    cluster_id = Column(String, nullable=False, index=True)
+    
+    # Reviewer information
+    reviewer_id = Column(String, nullable=True)  # For future: tie to auth system
+    reviewer_ip = Column(String, nullable=True)
+    
+    # Decision
+    previous_status = Column(String, nullable=False)
+    new_status = Column(String, nullable=False)  # CONFIRMED, FALSE_POSITIVE
+    reason = Column(String, nullable=True)  # Why this decision?
+    
+    # Timestamp
+    reviewed_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    __table_args__ = (
+        Index('idx_cluster_review_audit_cluster_id', 'cluster_id'),
+        Index('idx_cluster_review_audit_reviewed_at', 'reviewed_at'),
+    )
+    
+    def __repr__(self):
+        return f"<Audit({self.cluster_id}: {self.previous_status} → {self.new_status})>"
+    
+# ============================================================================
+# LAYER 6: ANALYSIS STATE (Worker Management)
 # ============================================================================
 
 class AnalysisState(Base):
@@ -193,3 +232,35 @@ class AnalysisState(Base):
 
     def __repr__(self):
         return f"<State(last_id={self.last_processed_metadata_id}, status={self.worker_status})>"
+    
+# ============================================================================
+# LAYER 7: DEAD LETTER QUEUE (Failed Processing)
+# ============================================================================
+
+class FailedMetadataProcessing(Base):
+    """
+    Tracks metadata records that failed processing.
+    Allows manual retry or investigation.
+    """
+    __tablename__ = "failed_metadata_processing"
+    
+    id = Column(Integer, primary_key=True)
+    metadata_id = Column(Integer, nullable=False, index=True)
+    user_id = Column(String, nullable=False)
+    
+    # Error details
+    error_message = Column(String, nullable=False)
+    error_traceback = Column(String, nullable=True)
+    
+    # Retry tracking
+    retry_count = Column(Integer, default=0)
+    last_retry_at = Column(DateTime(timezone=True), nullable=True)
+    resolved = Column(Boolean, default=False)
+    
+    # Timestamp
+    failed_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    __table_args__ = (
+        Index('idx_failed_processing_metadata_id', 'metadata_id'),
+        Index('idx_failed_processing_resolved', 'resolved'),
+    )

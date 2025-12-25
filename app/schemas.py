@@ -28,6 +28,21 @@ class UserMetadataRequest(BaseModel):
 # OUTPUT SCHEMAS
 # ============================================================================
 
+class ClusterReviewRequest(BaseModel):
+    """Request for manual cluster review"""
+    decision: str = Field(..., pattern="^(CONFIRMED|FALSE_POSITIVE)$")
+    reason: Optional[str] = Field(None, description="Reason for this decision")
+    reviewer_id: Optional[str] = Field(None, description="Reviewer identifier")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "decision": "FALSE_POSITIVE",
+                "reason": "Family members using same WiFi",
+                "reviewer_id": "compliance_officer_123"
+            }
+        }
+
 class IngestionResponse(BaseModel):
     """Response after metadata ingestion"""
     status: str
