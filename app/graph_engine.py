@@ -4,6 +4,7 @@ from app.models import FailedMetadataProcessing, UserMetadata, EntityLink, Smurf
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime, timedelta, timezone
+from app.utils import ensure_utc
 import logging
 import json
 
@@ -450,7 +451,7 @@ class LinkBuilder:
             raw_confidence = sum(conf for _, conf in signal_confidences) / len(signal_confidences)
         
         # Apply temporal decay
-        age_days = (datetime.now(timezone.utc) - meta1.last_seen).days
+        age_days = (datetime.now(timezone.utc) - ensure_utc(meta1.last_seen)).days
         adjusted_confidence = self._apply_temporal_decay(raw_confidence, age_days)
     
         return adjusted_confidence
@@ -654,8 +655,7 @@ class GARGClusterDetector:
         """
         Recalculate temporal decay for a link based on current time.
         """
-        age_days = (datetime.now(timezone.utc) - link.first_linked).days
-        
+        age_days = (datetime.now(timezone.utc) - ensure_utc(link.first_linked)).days
         if age_days < self.config.DECAY_START_DAYS:
             return link.raw_confidence
         

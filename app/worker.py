@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class WorkerConfig:
     """Worker configuration parameters"""
     ANALYSIS_INTERVAL_SECONDS = 60  # Run every 1 minute
-    MIN_METADATA_BATCH = 1          # Only run if at least 5 new records
+    MIN_METADATA_BATCH = 1          # Only run if at least 1 new records
     MAX_RETRIES = 3                 # Retry on failure
     BACKOFF_MULTIPLIER = 2          # Exponential backoff
 
@@ -101,7 +101,7 @@ def should_run_analysis(db) -> bool:
             return False
             
     except Exception as e:
-        logger.error(f"Error checking analysis conditions: {e}")
+        logger.error(f"Error checking analysis conditions: {e}", exc_info=True)
         return False
 
 
