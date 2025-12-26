@@ -149,7 +149,7 @@ class GARGConfig:
 | Canvas only | 0.85 | ✅ Link created |
 | IP only (private) | 0.30 | ❌ No link |
 | IP only (public WiFi) | 0.05 | ❌ No link |
-| Device + IP | (0.95+0.30)/2 = 0.62 | ❌ No link |
+| Device + IP | (0.95+0.30)/2 = 0.62 | ✅ Link created |
 | Device + Canvas | (0.95+0.85)/2 = 0.90 | ✅ Link created |
 
 ### Risk Levels
@@ -355,14 +355,13 @@ MIN_LINK_CONFIDENCE = 0.65  # Was 0.70
 ## 📚 Documentation
 
 - **Complete Testing Guide**: `TESTING_GUIDE.md`
-- **Full Documentation**: `PROJECT_DOCUMENTATION.md`
 - **Installation Details**: `INSTALL.txt`
 
 ---
 
 ## ✅ Status
 
-**Version**: 2.0.0  
+**Version**: 2.1.0  
 **Rating**: 9/10 (MNC Grade)  
 **Status**: Production Ready  
 **Scale**: Tested up to 10,000+ users
