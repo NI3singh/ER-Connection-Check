@@ -33,68 +33,68 @@ def reset_sequences():
     """
     Reset all PostgreSQL sequences to match current max IDs.
     Call this if ID numbering gets out of sync.
+
+    All sequence resets are wrapped in a single transaction for atomicity.
     """
     print("🔧 Resetting database sequences...")
 
-    tables = ['user_metadata', 'entity_links', 'signal_strengths', 
-              'smurf_clusters', 'analysis_state']
-    
-    for table in tables:
-        try:
-            with engine.connect() as conn:
-                # Reset user_metadata sequence
-                conn.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('user_metadata', 'id'),
-                        COALESCE((SELECT MAX(id) FROM user_metadata), 0) + 1,
-                        false
-                    );
-                """))
-                
-                # Reset entity_links sequence
-                conn.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('entity_links', 'id'),
-                        COALESCE((SELECT MAX(id) FROM entity_links), 0) + 1,
-                        false
-                    );
-                """))
-                
-                # Reset signal_strengths sequence
-                conn.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('signal_strengths', 'id'),
-                        COALESCE((SELECT MAX(id) FROM signal_strengths), 0) + 1,
-                        false
-                    );
-                """))
-                
-                # Reset smurf_clusters sequence
-                conn.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('smurf_clusters', 'id'),
-                        COALESCE((SELECT MAX(id) FROM smurf_clusters), 0) + 1,
-                        false
-                    );
-                """))
-                
-                # Reset analysis_state sequence
-                conn.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('analysis_state', 'id'),
-                        COALESCE((SELECT MAX(id) FROM analysis_state), 0) + 1,
-                        false
-                    );
-                """))
-                
-                conn.commit()
-                
-            print("✅ All sequences reset successfully")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Failed to reset sequences: {e}")
-            return False
+    try:
+        # Use engine.begin() for proper transaction context
+        # All statements will be committed together, or rolled back on error
+        with engine.begin() as conn:
+            # Reset user_metadata sequence
+            conn.execute(text("""
+                SELECT setval(
+                    pg_get_serial_sequence('user_metadata', 'id'),
+                    COALESCE((SELECT MAX(id) FROM user_metadata), 0) + 1,
+                    false
+                );
+            """))
+
+            # Reset entity_links sequence
+            conn.execute(text("""
+                SELECT setval(
+                    pg_get_serial_sequence('entity_links', 'id'),
+                    COALESCE((SELECT MAX(id) FROM entity_links), 0) + 1,
+                    false
+                );
+            """))
+
+            # Reset signal_strengths sequence
+            conn.execute(text("""
+                SELECT setval(
+                    pg_get_serial_sequence('signal_strengths', 'id'),
+                    COALESCE((SELECT MAX(id) FROM signal_strengths), 0) + 1,
+                    false
+                );
+            """))
+
+            # Reset smurf_clusters sequence
+            conn.execute(text("""
+                SELECT setval(
+                    pg_get_serial_sequence('smurf_clusters', 'id'),
+                    COALESCE((SELECT MAX(id) FROM smurf_clusters), 0) + 1,
+                    false
+                );
+            """))
+
+            # Reset analysis_state sequence
+            conn.execute(text("""
+                SELECT setval(
+                    pg_get_serial_sequence('analysis_state', 'id'),
+                    COALESCE((SELECT MAX(id) FROM analysis_state), 0) + 1,
+                    false
+                );
+            """))
+
+        # Commit happens automatically when context exits successfully
+        print("✅ All sequences reset successfully")
+        return True
+
+    except Exception as e:
+        # Transaction automatically rolled back on error
+        print(f"❌ Failed to reset sequences: {e}")
+        return False
 
 def init_database():
     """

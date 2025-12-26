@@ -22,11 +22,15 @@ ORDER BY id ASC
 SELECT * FROM public.entity_links
 ORDER BY id ASC 
 
+-- Get investigation records
+SELECT * FROM public.investigation_flags
+ORDER BY id ASC 
+
 -- Delete all data
 TRUNCATE user_metadata, entity_links, signal_strengths, smurf_clusters, analysis_state CASCADE;
 
 --Delete all tables
-DROP TABLE IF EXISTS user_metadata, entity_links, signal_strengths, smurf_clusters, analysis_state;
+DROP TABLE IF EXISTS user_metadata, entity_links, signal_strengths, smurf_clusters, analysis_state, investigation_flags;
 
 -- Deletes all derived and state tables.
 DELETE FROM public.analysis_state
